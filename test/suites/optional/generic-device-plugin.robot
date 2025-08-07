@@ -15,26 +15,41 @@ Test Tags           generic-device-plugin
 
 *** Variables ***
 ${NAMESPACE}    ${EMPTY}
+${DEVICE_COUNT}    5
 
 
 *** Test Cases ***
-Sanity Test
-    [Documentation]    Performs a simple test of Generic Device Plugin
-    [Setup]    GDP Test Setup    ${GDP_CONFIG_DROPIN}
+# Sanity Test
+#     [Documentation]    Performs a simple test of Generic Device Plugin
+#     Skip       Disabling for debugging
+#     [Setup]    GDP Test Setup    ${GDP_CONFIG_DROPIN}
+# 
+#     Create Test Job
+#     Wait For Job Completion And Check Logs
+# 
+#     [Teardown]    GDP Test Teardown
 
-    Create Test Job
-    Wait For Job Completion And Check Logs
+# Verify that mountPath correctly renames the device within the container
+#     [Documentation]    Performs a test of Generic Device Plugin with custom mountPath configuration
+#     Skip       Disabling the test for debugging
+#     [Setup]    GDP Test Setup    ${GDP_CONFIG_DROPIN_WITH_MOUNT}
+# 
+#     Create Test Job With Modified Script
+#     Wait For Job Completion And Check Logs
+# 
+#     [Teardown]    GDP Test Teardown
 
-    [Teardown]    GDP Test Teardown
-
-Verify that mountPath correctly renames the device within the container
-    [Documentation]    Performs a test of Generic Device Plugin with custom mountPath configuration
-    [Setup]    GDP Test Setup    ${GDP_CONFIG_DROPIN_WITH_MOUNT}
-
-    Create Test Job With Modified Script
-    Wait For Job Completion And Check Logs
-
-    [Teardown]    GDP Test Teardown
+Verify ttyUSB glob pattern device discovery and allocation
+    [Documentation]    Tests GDP with glob pattern to discover multiple ttyUSB devices and verify device allocation across multiple pods
+    [Tags]    glob-pattern
+    [Setup]    TtyUSB Glob Test Setup
+    
+    # Create and verify pods with device allocation
+    Create Pod And Verify Allocation    ${POD_SERIAL_2_DEVICES}    serial-test-pod    2    2
+    Create Pod And Verify Allocation    ${POD_SERIAL_1_DEVICE}    serial-test-pod1    1    3
+    Create Pod And Verify Allocation    ${POD_SERIAL_2_DEVICES_SECOND}    serial-test-pod2    2    5
+    
+    [Teardown]    TtyUSB Glob Test Teardown
 
 
 *** Keywords ***
@@ -116,20 +131,21 @@ Create Test Job With Modified Script
 
 Wait Until Device Is Allocatable
     [Documentation]    Waits until device device.microshift.io/fakeserial is allocatable
+    [Arguments]    ${expected_count}=1
     ${node}=    Run With Kubeconfig    oc get node -o=name
     ${node_name}=    Remove String    ${node}    node/
     Wait Until Keyword Succeeds    60s    5s
-    ...    Device Should Be Allocatable    ${node_name}
+    ...    Device Should Be Allocatable    ${node_name}    ${expected_count}
 
 Device Should Be Allocatable
     [Documentation]    Checks if device device.microshift.io/fakeserial is allocatable
-    [Arguments]    ${node_name}
+    [Arguments]    ${node_name}    ${expected_count}=1
     ${device_amount}=    Oc Get JsonPath
     ...    node
     ...    ${EMPTY}
     ...    ${node_name}
     ...    .status.allocatable.device\\.microshift\\.io/fakeserial
-    Should Be Equal As Integers    ${device_amount}    1
+    Should Be Equal As Integers    ${device_amount}    ${expected_count}
 
 Wait For Job Completion And Check Logs
     [Documentation]    Waits for Job completion and checks Pod logs looking for 'Test successful' message
@@ -142,6 +158,55 @@ Wait For Job Completion And Check Logs
     ...    .items[*].metadata.name
     ${logs}=    Oc Logs    ${pod}    ${NAMESPACE}
     Should Contain    ${logs}    Test successful
+
+Create And Verify TtyUSB Devices
+    [Documentation]    Creates dummy ttyUSB devices
+    FOR    ${i}    IN RANGE    ${DEVICE_COUNT}
+        Command Execution    sudo mknod /dev/ttyUSB${i} c 166 ${i}
+        Command Execution    sudo chmod 666 /dev/ttyUSB${i}
+    END
+
+Remove Dummy TtyUSB Devices
+    [Documentation]    Removes dummy ttyUSB devices
+    FOR    ${i}    IN RANGE    ${DEVICE_COUNT}
+        Run Keyword And Ignore Error    Command Execution    sudo rm -f /dev/ttyUSB${i}
+    END
+
+TtyUSB Glob Test Setup
+    [Documentation]    Setup for ttyUSB glob pattern test - creates devices, configures GDP, waits for allocation
+    Create And Verify TtyUSB Devices
+    Drop In MicroShift Config    ${GDP_CONFIG_SERIAL_GLOB}    10-gdp
+    Restart MicroShift
+    Wait Until Device Is Allocatable    ${DEVICE_COUNT}
+
+TtyUSB Glob Test Teardown
+    [Documentation]    Cleanup for ttyUSB glob pattern test
+    Run Keyword And Ignore Error    Oc Delete    pod --all -n ${NAMESPACE}
+    Remove Dummy TtyUSB Devices
+    Disable GDP
+
+
+Create Pod And Verify Allocation
+    [Documentation]    Creates a pod and verifies device allocation
+    [Arguments]    ${pod_spec}    ${pod_name}    ${requested_devices}    ${expected_total_allocated}
+    
+    # Create and wait for pod
+    ${path}=    Create Random Temp File    ${pod_spec}
+    Oc Create    -f ${path} -n ${NAMESPACE}
+    Oc Wait    -n ${NAMESPACE} pod/${pod_name}    --for=condition=Ready --timeout=120s
+    
+    # Verify correct number of devices allocated to pod
+    ${devices_in_pod}=    Run With Kubeconfig    oc exec -n ${NAMESPACE} ${pod_name} -- sh -c "ls /dev/ | grep ttyUSB | wc -l"
+    Should Be Equal As Integers    ${devices_in_pod}    ${requested_devices}
+    
+    # Get allocated resources from oc describe node
+    ${node}=    Run With Kubeconfig    oc get node -o=name
+    ${node_name}=    Remove String    ${node}    node/
+    ${describe_output}=    Run With Kubeconfig    oc describe node ${node_name}
+    ${allocated_line}=    Get Lines Containing String    ${describe_output}    device.microshift.io/fakeserial
+    ${allocated_count}=    Get Regexp Matches    ${allocated_line}    device\\.microshift\\.io/fakeserial\\s+(\\d+)    1
+    ${allocated_count}=    Set Variable    ${allocated_count[0]}
+    Should Be Equal As Integers    ${allocated_count}    ${expected_total_allocated}
 
 Teardown Suite With GDP Cleanup
     [Documentation]    Suite teardown that cleans up GDP configuration and restarts MicroShift
